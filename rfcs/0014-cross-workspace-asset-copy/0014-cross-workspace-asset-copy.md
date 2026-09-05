@@ -1,283 +1,169 @@
 ---
 start_date: 2026-09-02
 mlflow_issue: TBD
-rfc_pr:
+rfc_pr: https://github.com/Al-Pragliola/rfcs/pull/1
 ---
 
-# RFC 0014: Cross-workspace MLflow asset copying for fork-and-iterate workflows
+# RFC 0014: Cross-workspace MLflow asset sharing and copying
 
-| **Date Last Modified** | 2026-09-03 |
+| **Date Last Modified** | 2026-09-05 |
 | :--------------------- | :--------- |
 
 **Table of contents**
 
 - [Summary](#summary)
 - [Basic example](#basic-example)
-  - [Fork a prompt](#fork-a-prompt)
-  - [Detach a synced prompt](#detach-a-synced-prompt)
-  - [Copy or promote a prompt back](#copy-or-promote-a-prompt-back)
+  - [Fork and promote a prompt](#fork-and-promote-a-prompt)
+  - [Sync and detach a prompt](#sync-and-detach-a-prompt)
 - [Motivation](#motivation)
   - [The problem](#the-problem)
   - [Goals](#goals)
   - [User journeys](#user-journeys)
   - [Out of scope](#out-of-scope)
 - [Detailed design](#detailed-design)
-  - [Terminology and invariants](#terminology-and-invariants)
-  - [Core operation modes & semantics](#core-operation-modes--semantics)
-  - [Overwrite guardrail and client expectations](#overwrite-guardrail-and-client-expectations)
+  - [Operation semantics](#operation-semantics)
   - [Asset-specific copy contents](#asset-specific-copy-contents)
-  - [Model version provenance tags](#model-version-provenance-tags)
   - [Authorization and visibility](#authorization-and-visibility)
-  - [Transactions, conflicts, and idempotency](#transactions-conflicts-and-idempotency)
+  - [MLflow UI](#mlflow-ui)
+  - [Transactions, conflicts, and retries](#transactions-conflicts-and-retries)
   - [API](#api)
     - [Typed RPC routes](#typed-rpc-routes)
-    - [Copy routes](#copy-routes)
-    - [Detach routes](#detach-routes)
+    - [Copy requests](#copy-requests)
+    - [Detach requests](#detach-requests)
+    - [Source deletion requests](#source-deletion-requests)
+    - [Canonical resource responses](#canonical-resource-responses)
     - [Native MlflowClient Python SDK](#native-mlflowclient-python-sdk)
+    - [Store interfaces](#store-interfaces)
     - [HTTP status and error behavior](#http-status-and-error-behavior)
-  - [Database relational schema](#database-relational-schema)
-    - [workspace_asset_links](#workspace_asset_links)
-    - [workspace_asset_operations](#workspace_asset_operations)
-    - [workspace_asset_version_mappings](#workspace_asset_version_mappings)
+  - [Database schema](#database-schema)
   - [Read and mutation behavior](#read-and-mutation-behavior)
   - [Rename and delete lifecycle](#rename-and-delete-lifecycle)
 - [Acceptance criteria](#acceptance-criteria)
 - [Drawbacks](#drawbacks)
 - [Alternatives](#alternatives)
 - [Adoption strategy](#adoption-strategy)
-- [Open questions](#open-questions)
 
 # Summary
 
-MLflow workspaces support per-asset operations that let users reuse a prompt, registered model, or MLflow MCP registry entry from a source workspace in a target workspace. The operations are strictly metadata-only and designed for fork-and-iterate workflows. The API provides only TWO endpoints per asset type:
+This proposal lets teams share prompts, registered models, and MCP server registry entries across MLflow workspaces through the MLflow UI, Python SDK, and REST APIs.
 
-- `POST /api/{version}/mlflow/{asset-type}/copy` (supports `SYNC`, `FORK`, and `COPY` modes)
-- `POST /api/{version}/mlflow/{asset-type}/detach`
+It supports two complementary workflows. Teams can make selected assets from a shared workspace discoverable in their own workspace, with a read-only view that follows source changes. They can also create editable forks, develop them independently, and promote approved changes back. An independent copy supports reuse without retaining a relationship to the source.
 
-Detailed operation modes:
-
-- **Sync (`relationship_type: "SYNC"`)**: Creates a read-only linked reference via `workspace_asset_links` (`relationship_type: "SYNC"`). When the destination workspace is queried, the MLflow server performs query-time SQL joins against `workspace_asset_links` to resolve source asset metadata in real time. No destination database rows or version mappings are created. Any mutation (`update`, `create_version`, `set_tag`, `delete`) on a synced destination asset is blocked with a read-only error (`INVALID_PARAMETER_VALUE`).
-- **Fork (`relationship_type: "FORK"`)**: Creates an independent, editable copy of the asset metadata in destination workspace rows. Artifact locations are preserved as URI pointers (`source`, `storage_location`), with NO artifact byte copying. Creates an association in `workspace_asset_links` (`relationship_type: "FORK"`) for lineage tracking and records source-to-target version mappings in `workspace_asset_version_mappings`. If the target asset name already exists in the destination workspace, the operation fails with `RESOURCE_ALREADY_EXISTS`.
-- **Copy / Promote-Back (`relationship_type: "COPY"`)**: Copies an asset to a target workspace, overwriting any same-named asset in the destination. Replaces target metadata and versions atomically if it exists, or creates it if not. Promote-back is executed simply by calling `/copy` with `relationship_type: "COPY"`, overwriting the target asset by name without creating an association link. By design, COPY mode creates NO entry in `workspace_asset_links` so that the copied/promoted asset is completely decoupled from the source. Records the operation in `workspace_asset_operations` with `relationship_type: "COPY"`, attaching immutable version provenance tags (`mlflow.copy.*`).
-- **Detach**: Dedicated endpoint `POST /api/{version}/mlflow/{asset-type}/detach` taking `{association_id, target_workspace, idempotency_key}`. Converts an active `SYNC` link into an independent `FORK`, snapshotting current state into local destination database rows and updating `workspace_asset_links.relationship_type = "FORK"`. Subsequent source changes are no longer reflected.
-- **Client & UI Guardrail**: Direct MLflow UI modifications for workspace navigation are out of scope for this server-side RFC. Client applications and UI consumers implementing the `COPY` overwrite workflow are expected to display an explicit confirmation dialog before dispatching a request that replaces an existing destination asset.
-
-Unlink operations are out of scope for v1 (stale link cleanup when a source is deleted is addressed in Open Questions / Future Work).
-
-The proposal covers prompts (whose metadata is represented by MLflow registry records), registered models, and MLflow MCP registry entries. It adds typed MLflow RPC-style routes for copy and detach, durable operation records in `workspace_asset_operations`, associations for sync and fork lineage in `workspace_asset_links` (which stores `SYNC` and `FORK` relationships ONLY), and source-to-destination version mappings in `workspace_asset_version_mappings`. It does not copy artifact bytes or manage runtime deployments.
+Users can turn a synced asset into an editable fork when they need to customize it. Replacing an existing asset requires explicit consent, and deleting a source preserves its dependents only after the user chooses to detach them. Model copying preserves artifact references; it does not transfer the underlying model files.
 
 # Basic example
 
-The route identifies the asset type (`prompts`, `registered-models`, or `mcp-servers`). A prompt request cannot select a model or MCP entry in its body. The server checks source and target permissions, executes the transaction, and returns the durable operation result.
+These examples use the proposed Python SDK. The same actions are available from asset pages in the MLflow UI, as described in [MLflow UI](#mlflow-ui).
 
-## Fork a prompt
+## Fork and promote a prompt
 
-The caller sends a `POST` request to `/api/3.0/mlflow/prompts/copy` with `relationship_type: "FORK"`.
+An engineer forks an approved prompt into the team's workspace:
 
-```http
-POST /api/3.0/mlflow/prompts/copy
-Content-Type: application/json
+```python
+from mlflow import MlflowClient
 
-{
-  "source_workspace": "shared",
-  "source_name": "support-assistant",
-  "target_workspace": "team-search",
-  "target_name": "support-assistant-team",
-  "relationship_type": "FORK",
-  "idempotency_key": "op_fork_01J"
-}
+client = MlflowClient()
+prompt = client.get_prompt("support-assistant", workspace="shared")
+
+forked_prompt = client.fork_prompt(
+    prompt,
+    target_workspace="team-search",
+    target_name="support-assistant-team",
+)
 ```
 
-Response:
+The team edits the fork using the existing prompt APIs in `team-search`. After the changes have been approved, the engineer promotes the current fork back:
 
-```json
-{
-  "resource_type": "prompt",
-  "source_workspace": "shared",
-  "source_name": "support-assistant",
-  "target_workspace": "team-search",
-  "target_name": "support-assistant-team",
-  "operation_id": "op_01JPROMPTFORK7K4H9M6T2",
-  "status": "COMPLETED",
-  "copy_mode": "METADATA_ONLY",
-  "relationship_type": "FORK",
-  "association_id": "op_01JPROMPTFORK7K4H9M6T2",
-  "lineage_id": "op_01JPROMPTFORK7K4H9M6T2",
-  "source_snapshot_fingerprint": "registry-metadata-sha256:...",
-  "creation_time": 1788307200000,
-  "last_updated_time": 1788307200000,
-  "version_mappings": [
-    {"source_version": "1", "target_version": "1"},
-    {"source_version": "2", "target_version": "2"}
-  ]
-}
+```python
+updated_prompt = client.get_prompt(
+    "support-assistant-team", workspace="team-search"
+)
+promoted_prompt = client.copy_prompt(
+    updated_prompt,
+    target_workspace="shared",
+    target_name="support-assistant",
+    overwrite=True,
+)
 ```
 
-The target rows are editable after this response. If `support-assistant-team` already exists in `team-search`, the request fails with `RESOURCE_ALREADY_EXISTS`.
+Without `overwrite=True`, an existing destination is left intact and the call reports a conflict. The returned prompt is the destination resource, equivalent to fetching it after the operation. Copying to a new name uses the same method with the default `overwrite=False`.
 
-## Detach a synced prompt
+## Sync and detach a prompt
 
-When a prompt is synced, calling `/api/3.0/mlflow/prompts/detach` converts the read-only `SYNC` link into an independent `FORK`.
+An engineer makes the approved prompt discoverable in the team's workspace under a local name:
 
-```http
-POST /api/3.0/mlflow/prompts/detach
-Content-Type: application/json
-
-{
-  "association_id": "assoc_123",
-  "target_workspace": "team-search",
-  "idempotency_key": "op_detach_456"
-}
+```python
+synced_prompt = client.sync_prompt(
+    prompt,
+    target_workspace="team-search",
+    target_name="support-assistant-reference",
+)
+live_prompt = client.get_prompt(
+    "support-assistant-reference", workspace="team-search"
+)
 ```
 
-Response:
+The synced prompt follows source changes and is read-only. When the team needs to edit it, the engineer detaches it in place:
 
-```json
-{
-  "relationship": {
-    "association_id": "assoc_123",
-    "resource_type": "prompt",
-    "relationship_type": "FORK",
-    "source_workspace": "shared",
-    "source_name": "support-assistant",
-    "target_workspace": "team-search",
-    "target_name": "support-assistant",
-    "operation_id": "op_detach_456",
-    "lineage_id": "assoc_123",
-    "status": "COMPLETED",
-    "copy_mode": "METADATA_ONLY",
-    "creation_time": 1788307200000,
-    "last_updated_time": 1788307250000,
-    "source_snapshot_fingerprint": "registry-metadata-sha256:...",
-    "version_mappings": [
-      {"source_version": "1", "target_version": "1"}
-    ]
-  }
-}
+```python
+editable_prompt = client.detach_prompt(
+    workspace="team-search",
+    name="support-assistant-reference",
+)
 ```
 
-## Copy or promote a prompt back
-
-To copy an asset to a target workspace with overwrite semantics (promoting a fork back or copying across workspaces), the canonical invocation uses `/copy` with `relationship_type: "COPY"`. By design, COPY mode creates NO entry in `workspace_asset_links` so that the copied/promoted asset is completely decoupled from the source.
-
-```http
-POST /api/3.0/mlflow/prompts/copy
-Content-Type: application/json
-
-{
-  "source_workspace": "team-search",
-  "source_name": "support-assistant-team",
-  "target_workspace": "shared",
-  "target_name": "support-assistant",
-  "relationship_type": "COPY",
-  "idempotency_key": "op_promote_789"
-}
-```
-
-Response:
-
-```json
-{
-  "resource_type": "prompt",
-  "source_workspace": "team-search",
-  "source_name": "support-assistant-team",
-  "target_workspace": "shared",
-  "target_name": "support-assistant",
-  "operation_id": "op_01JPROMPTCOPY9L2K8N",
-  "status": "COMPLETED",
-  "copy_mode": "METADATA_ONLY",
-  "relationship_type": "COPY",
-  "association_id": null,
-  "lineage_id": "op_01JPROMPTCOPY9L2K8N",
-  "source_snapshot_fingerprint": "registry-metadata-sha256:...",
-  "creation_time": 1788307200000,
-  "last_updated_time": 1788307300000,
-  "version_mappings": [
-    {"source_version": "1", "target_version": "1"},
-    {"source_version": "2", "target_version": "2"}
-  ]
-}
-```
-
-The operation overwrites target metadata and versions atomically if `support-assistant` exists in `shared` workspace, or creates it if absent. No entry is stored in `workspace_asset_links`.
+The result is an editable fork containing the current source content. Its relationship identifies the original prompt, but subsequent source changes no longer update the fork.
 
 # Motivation
 
 ## The problem
 
-Workspace isolation provides security boundary and access control, but creates friction when iterating across team boundaries. A prompt, registered model, or MCP server published in a central shared workspace often needs to be reused or adapted in a team workspace without altering the original asset. Conversely, when a team improves an asset, promoting those changes back to the parent workspace should be seamless and unambiguous.
-
-Today, treating these operations as ad hoc create and update calls leaves critical gaps:
-- Unclear semantics on whether a destination asset is a live view, a tracked fork, or a decoupled overwrite copy.
-- Inconsistent copying of versions, tags, aliases, and URI metadata.
-- Risk of accidental target overwrite without guardrails or explicit user warnings.
-- Lack of durable operational audit records and source-to-target version lineage.
-
-MLflow's cross-workspace copying feature addresses these gaps by establishing a formal contract and unified database storage layer for asset `SYNC`, `FORK`, `COPY`, and `DETACH` operations.
+Workspace isolation prevents teams from discovering and reusing selected assets from another workspace through a supported sharing workflow. An organization may maintain approved assets centrally, while teams need to find those assets locally, adapt them, and contribute approved improvements back. MLflow does not currently support this workflow across workspaces.
 
 ## Goals
 
-- Provide unified `SYNC`, `FORK`, and `COPY` operation modes on the `/copy` endpoint, alongside a dedicated `/detach` route across prompts, registered models, and MCP servers.
-- Keep `SYNC` assets read-only and resolved dynamically via query-time SQL joins without creating destination database rows.
-- Ensure `FORK` copies are independent, editable, and retain traceable lineage via `workspace_asset_links` (`relationship_type: "FORK"`), returning `RESOURCE_ALREADY_EXISTS` if target already exists.
-- Ensure `COPY` mode replaces target metadata and versions atomically, creating **NO entry in `workspace_asset_links`** so assets are completely decoupled.
-- Support promote-back workflows via `/copy` with `relationship_type: "COPY"`, overwriting the target asset by name without creating an association link.
-- Support client-side overwrite guardrails for `COPY` mode operations.
-- Preserve immutable provenance tags on model versions and enforce protection against modification or deletion.
-- Verify source read permission and target write permission using native MLflow authorization primitives.
-- Ensure safe retries via `idempotency_key`.
+- Make curated assets discoverable in team workspaces, with read-only synced assets transparently included in ordinary search and list results.
+- Let teams fork an asset, develop it independently, and identify its source.
+- Support independent copies and promotion of approved changes back to another workspace.
+- Let users turn a synced asset into an editable fork without changing its local name.
+- Provide these workflows in the MLflow UI as well as programmatic interfaces.
+- Prevent accidental replacement of existing assets and prevent source deletion from leaving broken relationships.
+- Respect source and destination access controls throughout sharing, reading, and editing.
 
 ## User journeys
 
-1. **Curated prompt synced for live discovery**: A user syncs a prompt from `shared` workspace into a personal workspace (`relationship_type: "SYNC"`). MLflow creates a link record in `workspace_asset_links`. Reads in the target workspace perform query-time SQL joins to resolve source metadata live. Destination rows are not created, and any attempt to mutate the synced asset returns a read-only error (`INVALID_PARAMETER_VALUE`).
-2. **Synced prompt detached into independent fork**: A user decides to customize a synced prompt and calls `POST /api/3.0/mlflow/prompts/detach`. MLflow snapshots the current source prompt state, materializes destination database rows and version mappings, and updates `workspace_asset_links.relationship_type` to `"FORK"`. The user can now edit the target asset independently.
-3. **Curated model directly forked to team workspace**: A user forks a registered model using `POST /api/2.0/mlflow/registered-models/copy` with `relationship_type: "FORK"`. Full model metadata, versions, tags, and aliases are materialized in the target workspace. If target asset exists, it returns `RESOURCE_ALREADY_EXISTS`. Version `source` and `storage_location` URI pointers are preserved as metadata; zero artifact bytes are transferred.
-4. **Team asset promoted back / overwrite copied to target workspace**: After refining a prompt or model fork, a user invokes `POST /api/{version}/mlflow/{asset-type}/copy` with `relationship_type: "COPY"`. The client application presents an explicit overwrite warning confirmation before proceeding. MLflow validates permissions, atomically replaces target asset metadata and versions, records the operation in `workspace_asset_operations` (`relationship_type: "COPY"`), and creates **NO row in `workspace_asset_links`**, leaving assets completely decoupled.
-5. **MCP server configuration copied**: A user copies an MCP server entry via `POST /api/2.0/mlflow/mcp-servers/copy`. Server configuration, versions, tags, and endpoints are copied as metadata, decoupled from runtime container lifecycle.
+1. An organization curates approved AI assets in a shared workspace. An engineer selects the assets relevant to their team so teammates and agents can find and use current versions from the team's workspace.
+2. A team needs to improve an approved asset. An engineer forks it into the team's workspace, iterates there, and promotes the changes back after review.
+3. An engineer discovers a useful asset in another team's workspace and copies it into their own workspace to develop it independently, without maintaining a source relationship.
+
+The [basic example](#basic-example) illustrates these workflows with SDK calls; the API contract is defined below.
 
 ## Out of scope
 
-- Single-version copying or partial version selection (copying applies strictly to the complete registered model asset).
-- Experiments, run tracking data, and run artifacts (deferred; operations focus strictly on AI asset registries).
-- Evaluation datasets.
-- MLflow traces and trace data.
-- Bulk workspace-level migrations (operations are strictly per-asset).
-- Bi-directional real-time synchronization (synchronization is strictly one-way, source-to-destination).
-- Frontend UI controls for cross-workspace browsing and operations (delegated to external client applications and platform integrations).
-- Platform-specific container orchestration or infrastructure lifecycle management.
-- Artifact byte copying, checksumming, or storage repository transfers.
-- Unlink operation in v1 (stale link cleanup when a source is deleted is addressed in Open Questions / Future Work).
-- Asynchronous background/saga execution models.
+- Single-version copying or partial version selection.
+- Experiments, runs, evaluation datasets, and traces.
+- Bulk workspace-level migrations.
+- Bidirectional synchronization.
+- Copying model artifact bytes or replicating storage.
 
 # Detailed design
 
-## Terminology and invariants
+## Operation semantics
 
-- **Asset Identity**: Uniquely identified by `(workspace, name)` for resource types `prompt`, `registered_model`, and `mcp_server`.
-- **`workspace_asset_links`**: The association table recording active `SYNC` and `FORK` lineage. Stores `SYNC` and `FORK` relationships ONLY; `COPY` mode creates no rows here.
-- **`workspace_asset_operations`**: The durable audit log and idempotency operations table recording all operations (`SYNC`, `FORK`, `COPY`, `detach`).
-- **`workspace_asset_version_mappings`**: The table mapping source version identifiers to target version identifiers.
+An asset is identified by its resource type, workspace, and name. Operations apply to the complete parent asset and its version history.
 
-Key invariants:
-1. `SYNC` creates a row in `workspace_asset_links` with `relationship_type = "SYNC"`. It creates no destination asset rows and no version mappings. Queries in the target workspace perform SQL joins against `workspace_asset_links` to resolve source content live.
-2. Synced assets are read-only. Any attempt to modify, set tags, create versions, or delete a synced asset returns `INVALID_PARAMETER_VALUE`.
-3. `FORK` creates destination rows, records source-to-target version mappings in `workspace_asset_version_mappings`, and maintains an association in `workspace_asset_links` (`relationship_type = "FORK"`). If target asset already exists in the target workspace, `FORK` fails with `RESOURCE_ALREADY_EXISTS`.
-4. `COPY` copies an asset to a target workspace, overwriting any same-named asset in destination metadata and versions atomically (or creating it if absent). By design, COPY mode creates NO entry in `workspace_asset_links` so that the copied/promoted asset is completely decoupled from the source. Records operation in `workspace_asset_operations` (`relationship_type = "COPY"`) and attaches immutable version provenance tags (`mlflow.copy.*`).
-5. `DETACH` converts an active `SYNC` association to `FORK`, snapshots current source state, materializes destination rows, records version mappings, and updates `workspace_asset_links.relationship_type = "FORK"`.
+| Operation | Destination content | Relationship to source |
+| :--- | :--- | :--- |
+| Sync | Read-only, live view of source metadata | `SYNC` |
+| Fork | Editable snapshot | `FORK` |
+| Copy | Editable snapshot | None |
+| Detach | Materializes the current synced content in place | Changes `SYNC` to `FORK` |
 
-## Core operation modes & semantics
+`SYNC` stores a relationship without creating destination asset or version rows. `FORK` and `COPY` materialize destination metadata. A fork fails if the destination asset already exists. `COPY` replaces the destination's metadata and full version history only when `overwrite=true`; with the default `overwrite=false`, an existing destination causes a conflict.
 
-| Mode / Route | Destination Asset Rows | Read Behavior | Destination Mutations | Association Table (`workspace_asset_links`) | Operations Audit Log (`workspace_asset_operations`) | Version Mappings |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Sync** (`/copy` with `relationship_type: "SYNC"`) | None | Resolves source state in real time via query-time SQL joins | Blocked with `INVALID_PARAMETER_VALUE` error | Active row (`relationship_type: "SYNC"`) | Recorded (`relationship_type: "SYNC"`) | None |
-| **Fork** (`/copy` with `relationship_type: "FORK"`) | Materialized in target workspace | Independent target asset rows | Allowed | Active row (`relationship_type: "FORK"`). Fails with `RESOURCE_ALREADY_EXISTS` if target exists | Recorded (`relationship_type: "FORK"`) | Recorded in `workspace_asset_version_mappings` |
-| **Copy / Promote-Back** (`/copy` with `relationship_type: "COPY"`) | Replaces/creates target asset rows atomically | Independent target asset rows | Allowed | **No entry created** (assets are completely decoupled) | Recorded (`relationship_type: "COPY"`) | Recorded in `workspace_asset_version_mappings` |
-| **Detach** (`/detach`) | Materialized in target workspace | Independent target asset rows | Allowed | Updated from `SYNC` to `relationship_type: "FORK"` | Recorded (`relationship_type: "FORK"`, operation: `detach`) | Recorded in `workspace_asset_version_mappings` |
+A copied destination has no incoming source relationship, including when it replaces a fork. Detach takes a snapshot of an active `SYNC` relationship and changes it to `FORK`, allowing the destination content to be edited independently.
 
-## Overwrite guardrail and client expectations
-
-- **Client Scope**: Cross-workspace copy, sync, and detach operations are exposed via server REST APIs and the native Python `MlflowClient`. Direct MLflow UI enhancements for multi-workspace navigation are out of scope.
-- **Overwrite Confirmation Guardrail**: For `COPY` mode operations (which perform atomic replacement of target asset metadata and versions in the destination workspace), client applications and web consoles are expected to display an explicit confirmation dialog before dispatching the API request to prevent accidental data loss.
+Source deletion preserves dependent content and removes the relationships to the deleted source when the caller explicitly chooses to detach dependents. The complete behavior is defined in [Rename and delete lifecycle](#rename-and-delete-lifecycle).
 
 ## Asset-specific copy contents
 
@@ -293,21 +179,11 @@ Key invariants:
 - Downstream execution environments (such as model serving, batch inference, or evaluation runtimes) are expected to hold read credentials for the referenced storage URI scheme (e.g., shared object storage bucket access, cross-account IAM permissions, or container registry credentials).
 - Physical binary data replication across air-gapped or isolated storage repositories is an out-of-band operational concern (handled by dedicated storage replication pipelines), decoupled from MLflow's metadata catalog operations.
 
-## Model version provenance tags
-
-When model versions are copied during a `FORK`, `DETACH`, or `COPY` operation, MLflow automatically attaches immutable provenance tags to each target `ModelVersion` entity:
-
-- `mlflow.copy.operation_id`: ID of the copy operation recorded in `workspace_asset_operations`.
-- `mlflow.copy.source_workspace`: Name of the source workspace.
-- `mlflow.copy.source_name`: Name of the source registered model.
-- `mlflow.copy.source_version`: Source version string.
-- `mlflow.copy.source_uri`: Recorded source URI pointer metadata (stored as string metadata without dereferencing or accessing artifact repos).
-
-To maintain audit integrity, `set_model_version_tag` and `delete_model_version_tag` in the MLflow tracking store validate and reject any attempt to modify or delete these `mlflow.copy.*` tags (`_validate_copy_provenance_tag_mutation`).
+Fork lineage is recorded by the parent relationship in `workspace_asset_links`. No additional provenance tags are attached to copied versions.
 
 ## Authorization and visibility
 
-Authorization uses native MLflow permissions primitives:
+Authorization for copy and detach uses native MLflow permissions primitives:
 
 - **Source Read Permission**: The requesting user must have `can_read` (or workspace read capability) on the source workspace and asset.
 - **Target Write Permission**: The requesting user must have `can_update` or `can_use` (or workspace write capability) on the target workspace.
@@ -316,172 +192,269 @@ For overwrite `copy` (including promote-back), the user must have read access on
 
 Permissions checks are evaluated before any database mutations are performed.
 
-## Transactions, conflicts, and idempotency
+Source deletion continues to use the existing delete authorization.
 
-All copy and detach operations run within a single SQL transaction:
+## MLflow UI
+
+The asset list and detail pages for prompts, registered models, and MCP servers include cross-workspace actions. A user selects **Sync**, **Fork**, or **Copy**, then chooses an accessible destination workspace and target name. The dialog explains whether the result follows source updates, retains fork lineage, or becomes independent.
+
+Synced assets appear in the destination's normal lists and search results under their local names. Lists and detail pages show a synced or forked indicator, and the detail page links to the source when the user can access it. Synced detail pages expose versions and aliases and provide **Detach to edit**. Content editing controls remain disabled until detachment succeeds.
+
+The copy dialog submits with `overwrite=false` by default. If the destination exists, it identifies the destination and warns that replacement includes its full version history. Only confirming that replacement sends `overwrite=true`. A conflict discovered after the dialog opened returns to this confirmation flow. Promoting a fork uses the same copy dialog, prefilled with its source workspace and name.
+
+Deleting a source with relationships first returns a conflict. The UI explains that synced dependents will become independent snapshots and forks will lose their source relationship. **Delete and detach dependents** sends `detach_dependents=true` after explicit confirmation; cancelling leaves all assets intact.
+
+Successful actions open or refresh the destination detail page using the returned resource. These UI flows ship with the server and SDK support.
+
+## Transactions, conflicts, and retries
+
+Copy and detach retain the single SQL transaction design:
 
 1. Validate input parameters and permissions.
-2. Read source snapshot or validate association state.
-3. Check target conflicts:
-   - For `FORK` mode: Check if target asset already exists in target workspace. If so, abort transaction and return `RESOURCE_ALREADY_EXISTS` (`409 Conflict`).
-   - For `COPY` mode: Check if target asset exists. If so, atomically replace target metadata and versions; if not, create target asset.
-4. Perform database mutations (insert target asset rows, insert version mappings, insert/update link row for SYNC/FORK, insert operation record).
-5. Commit the transaction atomically.
+2. Read the source snapshot or validate the relationship state.
+3. Check destination conflicts. A fork fails if the target exists. A copy can replace an existing target only with `overwrite=true`.
+4. Materialize destination metadata where required and insert, update, or remove the parent relationship.
+5. Commit the transaction and return the destination resource.
 
-Idempotency is supported via the `idempotency_key` field (accepted in JSON request body or `Idempotency-Key` HTTP header). `workspace_asset_operations` enforces a scoped unique constraint on `(target_workspace, resource_type, created_by, idempotency_key)`, where `created_by` defaults to an empty string `''` when unauthenticated. This prevents cross-asset key collisions and ensures deterministic uniqueness across all SQL backends. Retrying a request with the same idempotency key returns the existing operation result.
+The server enforces the overwrite parameter; UI confirmation is the user-facing step that supplies it.
 
-# API
+A repeated fork or copy with `overwrite=false` can report that the target already exists. A request with `overwrite=true` remains an explicit replacement.
 
-## Typed RPC routes
+## API
 
-Cross-workspace operations use typed RPC endpoints under `/api/2.0/mlflow/` and `/api/3.0/mlflow/`:
+### Typed RPC routes
 
-- **Copy Routes**:
-  - `POST /api/3.0/mlflow/prompts/copy`
-  - `POST /api/2.0/mlflow/registered-models/copy`
-  - `POST /api/2.0/mlflow/mcp-servers/copy`
-- **Detach Routes**:
-  - `POST /api/3.0/mlflow/prompts/detach`
-  - `POST /api/2.0/mlflow/registered-models/detach`
-  - `POST /api/2.0/mlflow/mcp-servers/detach`
+The route selects the asset type; the request cannot substitute another resource type.
 
-## Copy routes
+| Asset | Copy, sync, and fork | Detach |
+| :--- | :--- | :--- |
+| Prompt | `POST /api/3.0/mlflow/prompts/copy` | `POST /api/3.0/mlflow/prompts/detach` |
+| Registered model | `POST /api/2.0/mlflow/registered-models/copy` | `POST /api/2.0/mlflow/registered-models/detach` |
+| MCP server | `POST /api/2.0/mlflow/mcp-servers/copy` | `POST /api/2.0/mlflow/mcp-servers/detach` |
 
-Request Body (`CopyPrompt`, `CopyRegisteredModel`, `CopyMCPServer`):
+### Copy requests
+
+`CopyPrompt`, `CopyRegisteredModel`, and `CopyMCPServer` have the same fields:
+
+| Field | Required / default | Meaning |
+| :--- | :--- | :--- |
+| `source_workspace` | Required | Source workspace |
+| `source_name` | Required | Source asset name |
+| `target_workspace` | Required | Destination workspace |
+| `target_name` | Defaults to `source_name` | Destination asset name |
+| `relationship_type` | Defaults to `"FORK"` | `"SYNC"`, `"FORK"`, or `"COPY"` |
+| `overwrite` | Boolean, defaults to `false` | Allows `COPY` to replace an existing destination |
+
+A `COPY` request against an existing destination without `overwrite=true` returns `409 Conflict` and leaves it unchanged. The overwrite parameter applies to `COPY`; `FORK` retains its existing destination-conflict behavior.
+
+### Detach requests
+
+`DetachPrompt`, `DetachRegisteredModel`, and `DetachMCPServer` accept only the public target identity:
 
 ```json
 {
-  "source_workspace": "shared",
-  "source_name": "support-assistant",
-  "target_workspace": "team-search",
-  "target_name": "support-assistant-team",
-  "relationship_type": "FORK",
-  "idempotency_key": "optional-key"
+  "workspace": "team-search",
+  "name": "support-assistant-reference"
 }
 ```
 
-Field rules:
-- `source_workspace` (required): Source workspace identifier.
-- `source_name` (required): Source asset name.
-- `target_workspace` (required): Destination workspace identifier.
-- `target_name` (optional): Destination asset name (defaults to `source_name`).
-- `relationship_type` (optional): Mode of copy operation:
-  - `"SYNC"`: Creates read-only linked reference in `workspace_asset_links`.
-  - `"FORK"` (default): Materializes independent copy in target workspace and records association in `workspace_asset_links`. Fails with `RESOURCE_ALREADY_EXISTS` if target asset exists.
-  - `"COPY"`: Overwrites same-named asset in destination workspace (or creates if absent). Creates NO entry in `workspace_asset_links` so assets remain completely decoupled.
-- `idempotency_key` (optional): Key for request deduplication. Can also be supplied via `Idempotency-Key` HTTP header.
+Both fields are required. The route supplies the resource type, and the server resolves the relationship internally. The response is the canonical destination resource with its relationship changed to `FORK`.
 
-Response Body:
+### Source deletion requests
 
-```json
-{
-  "resource_type": "prompt",
-  "source_workspace": "shared",
-  "source_name": "support-assistant",
-  "target_workspace": "team-search",
-  "target_name": "support-assistant-team",
-  "operation_id": "op_01J...",
-  "status": "COMPLETED",
-  "copy_mode": "METADATA_ONLY",
-  "relationship_type": "FORK",
-  "association_id": "op_01J...",
-  "lineage_id": "op_01J...",
-  "source_snapshot_fingerprint": "...",
-  "creation_time": 1788307200000,
-  "last_updated_time": 1788307200000,
-  "version_mappings": [
-    {"source_version": "1", "target_version": "1"},
-    {"source_version": "2", "target_version": "2"}
-  ]
-}
-```
+Existing parent-asset delete APIs gain an optional boolean `detach_dependents`, defaulting to `false`. The asset name and workspace continue to use each delete API's existing path, body, and workspace-scoping conventions.
 
-*Note*: For `relationship_type: "COPY"`, `association_id` in the response is `null` because no row is inserted into `workspace_asset_links`.
+With any outgoing `SYNC` or `FORK` relationship, the default request returns `409 Conflict`. With `detach_dependents=true`, dependent content is preserved and those relationships are removed before deletion. Existing delete authorization and the successful delete response format are retained.
 
-## Detach routes
+### Canonical resource responses
 
-Request Body (`DetachPrompt`, `DetachRegisteredModel`, `DetachMCPServer`):
+Copy and detach return the same resource representation and response envelope as the corresponding destination `GET`, evaluated after the change commits. They do not return an operation record. The SDK returns a `Prompt`, `RegisteredModel`, or `MCPServer`, respectively.
+
+Parent resource representations gain `workspace` where it is not already exposed, plus optional `relationship` metadata. For example, the following fields appear within a forked prompt's normal resource representation:
 
 ```json
 {
-  "association_id": "assoc_123",
-  "target_workspace": "team-search",
-  "idempotency_key": "optional-key"
-}
-```
-
-Response Body:
-
-```json
-{
+  "name": "support-assistant-team",
+  "workspace": "team-search",
+  "description": "A prompt for customer support",
   "relationship": {
-    "association_id": "assoc_123",
-    "resource_type": "prompt",
-    "relationship_type": "FORK",
-    "source_workspace": "shared",
-    "source_name": "support-assistant",
-    "target_workspace": "team-search",
-    "target_name": "support-assistant",
-    "operation_id": "op_detach_456",
-    "lineage_id": "assoc_123",
-    "status": "COMPLETED",
-    "copy_mode": "METADATA_ONLY",
-    "creation_time": 1788307200000,
-    "last_updated_time": 1788307250000,
-    "source_snapshot_fingerprint": "...",
-    "version_mappings": [
-      {"source_version": "1", "target_version": "1"}
-    ]
+    "type": "FORK",
+    "source": {
+      "workspace": "shared",
+      "name": "support-assistant"
+    }
   }
 }
 ```
 
-## Native MlflowClient Python SDK
+Other normal resource fields are omitted from this illustration only. A synced asset has the same relationship shape with `"type": "SYNC"`. Parent `GET`, search, and list representations expose the same relationship metadata. Native and independently copied resources omit `relationship`; their SDK property is `None`. Internal relationship identifiers are not part of the public contract.
 
-The Python SDK exposes 6 native methods on `mlflow.client.MlflowClient`:
+### Native MlflowClient Python SDK
+
+The SDK uses separate methods for distinct operations. The parent getters below support selecting the source workspace, as in the basic example. Other reads retain their existing workspace-scoping interface.
+
+Proposed public signatures, with method bodies omitted:
 
 ```python
-# Prompt operations
-client.copy_prompt(
-    source_workspace, source_name, target_workspace,
-    target_name=None, idempotency_key=None, relationship_type=None
-)
-client.detach_prompt(association_id, target_workspace, idempotency_key=None)
+class MlflowClient:
+    def get_prompt(
+        self, name: str, *, workspace: str | None = None
+    ) -> Prompt | None: ...
 
-# Registered model operations
-client.copy_registered_model(
-    source_workspace, source_name, target_workspace,
-    target_name=None, idempotency_key=None, relationship_type=None
-)
-client.detach_registered_model(association_id, target_workspace, idempotency_key=None)
+    def get_registered_model(
+        self, name: str, *, workspace: str | None = None
+    ) -> RegisteredModel: ...
 
-# MCP server operations
-client.copy_mcp_server(
-    source_workspace, source_name, target_workspace,
-    target_name=None, idempotency_key=None, relationship_type=None
-)
-client.detach_mcp_server(association_id, target_workspace, idempotency_key=None)
+    def get_mcp_server(
+        self, name: str, *, workspace: str | None = None
+    ) -> MCPServer: ...
+
+    def sync_prompt(
+        self, prompt: Prompt, *, target_workspace: str,
+        target_name: str | None = None,
+    ) -> Prompt: ...
+
+    def fork_prompt(
+        self, prompt: Prompt, *, target_workspace: str,
+        target_name: str | None = None,
+    ) -> Prompt: ...
+
+    def copy_prompt(
+        self, prompt: Prompt, *, target_workspace: str,
+        target_name: str | None = None, overwrite: bool = False,
+    ) -> Prompt: ...
+
+    def detach_prompt(self, *, workspace: str, name: str) -> Prompt: ...
+
+    def sync_registered_model(
+        self, model: RegisteredModel, *, target_workspace: str,
+        target_name: str | None = None,
+    ) -> RegisteredModel: ...
+
+    def fork_registered_model(
+        self, model: RegisteredModel, *, target_workspace: str,
+        target_name: str | None = None,
+    ) -> RegisteredModel: ...
+
+    def copy_registered_model(
+        self, model: RegisteredModel, *, target_workspace: str,
+        target_name: str | None = None, overwrite: bool = False,
+    ) -> RegisteredModel: ...
+
+    def detach_registered_model(
+        self, *, workspace: str, name: str
+    ) -> RegisteredModel: ...
+
+    def sync_mcp_server(
+        self, server: MCPServer, *, target_workspace: str,
+        target_name: str | None = None,
+    ) -> MCPServer: ...
+
+    def fork_mcp_server(
+        self, server: MCPServer, *, target_workspace: str,
+        target_name: str | None = None,
+    ) -> MCPServer: ...
+
+    def copy_mcp_server(
+        self, server: MCPServer, *, target_workspace: str,
+        target_name: str | None = None, overwrite: bool = False,
+    ) -> MCPServer: ...
+
+    def detach_mcp_server(self, *, workspace: str, name: str) -> MCPServer: ...
+
+    def delete_prompt(
+        self, name: str, *, detach_dependents: bool = False
+    ) -> None: ...
+
+    def delete_registered_model(
+        self, name: str, *, detach_dependents: bool = False
+    ) -> None: ...
+
+    def delete_mcp_server(
+        self, name: str, *, detach_dependents: bool = False
+    ) -> None: ...
 ```
 
-In `copy_*` methods, `relationship_type` accepts `"SYNC"`, `"FORK"`, or `"COPY"` (default `"FORK"`).
+The SDK takes the source workspace and name from the supplied parent resource. The server reads the source asset's current state and copies the complete asset.
 
-## HTTP status and error behavior
+`sync_*`, `fork_*`, and `copy_*` select `SYNC`, `FORK`, and `COPY` respectively on the shared server endpoint. Only `copy_*` exposes overwrite. The methods copy the whole parent asset, independent of which versions the caller has loaded.
 
-| Status | Condition | Meaning |
-| :--- | :--- | :--- |
-| `200 OK` / `201 Created` | Request completed successfully | Operation committed durable records |
-| `400 Bad Request` | Missing required fields, invalid parameters, or mutation on read-only SYNC asset | Returns `INVALID_PARAMETER_VALUE` error |
-| `403 Forbidden` | Authorization failure | Insufficient permissions on source or target workspace |
-| `404 Not Found` | Source asset or association ID not found | Returns `RESOURCE_DOES_NOT_EXIST` error |
-| `409 Conflict` | Target asset name conflict on `FORK` | Returns `RESOURCE_ALREADY_EXISTS` error when target asset already exists in target workspace during a `FORK` operation |
+### Store interfaces
 
-# Database relational schema
+Prompts and registered models belong to the [model registry AbstractStore](https://github.com/mlflow/mlflow/blob/master/mlflow/store/model_registry/abstract_store.py). The proposed additions use explicit identities and a mode at the store boundary, while the public SDK keeps its separate methods:
 
-The cross-workspace asset copy feature uses a unified database schema with three tables prefixed by `workspace_asset_*`:
+```python
+from typing import Literal
 
-## `workspace_asset_links`
+class AbstractStore:
+    # mlflow/store/model_registry/abstract_store.py
 
-Stores active `SYNC` and `FORK` associations ONLY. Mode `COPY` operations create NO entries in this table, ensuring parent and copied assets remain completely decoupled.
+    def copy_prompt(
+        self, *, source_workspace: str, source_name: str,
+        target_workspace: str, target_name: str | None = None,
+        relationship_type: Literal["SYNC", "FORK", "COPY"] = "FORK",
+        overwrite: bool = False,
+    ) -> Prompt: ...
+
+    def detach_prompt(self, *, workspace: str, name: str) -> Prompt: ...
+
+    def copy_registered_model(
+        self, *, source_workspace: str, source_name: str,
+        target_workspace: str, target_name: str | None = None,
+        relationship_type: Literal["SYNC", "FORK", "COPY"] = "FORK",
+        overwrite: bool = False,
+    ) -> RegisteredModel: ...
+
+    def detach_registered_model(
+        self, *, workspace: str, name: str
+    ) -> RegisteredModel: ...
+
+    # Existing deletes retain their name argument and workspace context.
+    def delete_prompt(
+        self, name: str, *, detach_dependents: bool = False
+    ) -> None: ...
+
+    def delete_registered_model(
+        self, name: str, *, detach_dependents: bool = False
+    ) -> None: ...
+```
+
+MCP operations belong to the [tracking AbstractStore](https://github.com/mlflow/mlflow/blob/master/mlflow/store/tracking/abstract_store.py), through the `MCPServerRegistryMixin` described in [RFC 0004](../0004-mcp-registry/0004-mcp-registry.md#abstract-store-interface). Its additional effective signatures are:
+
+```python
+class AbstractStore(MCPServerRegistryMixin, GatewayStoreMixin):
+    # mlflow/store/tracking/abstract_store.py; methods supplied by the MCP mixin.
+
+    def copy_mcp_server(
+        self, *, source_workspace: str, source_name: str,
+        target_workspace: str, target_name: str | None = None,
+        relationship_type: Literal["SYNC", "FORK", "COPY"] = "FORK",
+        overwrite: bool = False,
+    ) -> MCPServer: ...
+
+    def detach_mcp_server(self, *, workspace: str, name: str) -> MCPServer: ...
+
+    def delete_mcp_server(
+        self, name: str, *, detach_dependents: bool = False
+    ) -> None: ...
+```
+
+SQL store implementations perform the copy and detach transactions. REST store implementations forward these calls to the typed endpoints. The delete methods expose the option to detach dependents as part of source deletion.
+
+### HTTP status and error behavior
+
+| Status | Condition |
+| :--- | :--- |
+| `200 OK` / `201 Created` | Copy or detach succeeds and returns the canonical destination resource |
+| `400 Bad Request` | Missing required fields, invalid parameters, or content mutation/deletion of a read-only synced asset; `INVALID_PARAMETER_VALUE` |
+| `403 Forbidden` | Insufficient source or destination permissions |
+| `404 Not Found` | Required source or target asset does not exist; `RESOURCE_DOES_NOT_EXIST` |
+| `409 Conflict` | Existing destination for fork or copy without overwrite; `RESOURCE_ALREADY_EXISTS` |
+| `409 Conflict` | Source deletion has dependents without explicit consent; `RESOURCE_CONFLICT` |
+
+## Database schema
+
+One table, `workspace_asset_links`, stores active parent-level `SYNC` and `FORK` relationships. It is the source of truth for relationship metadata. Copying creates no relationship row, and no separate operation history or version-mapping table is needed.
 
 ```sql
 CREATE TABLE workspace_asset_links (
@@ -492,12 +465,9 @@ CREATE TABLE workspace_asset_links (
     source_name VARCHAR(256) NOT NULL,
     target_workspace VARCHAR(63) NOT NULL,
     target_name VARCHAR(256) NOT NULL,
-    operation_id VARCHAR(32) NOT NULL,
     lineage_id VARCHAR(32) NOT NULL,
     created_by VARCHAR(256),
     creation_time BIGINT NOT NULL,
-    last_updated_time BIGINT NOT NULL,
-    source_snapshot_fingerprint VARCHAR(64),
     CONSTRAINT workspace_asset_links_pk PRIMARY KEY (association_id),
     CONSTRAINT workspace_asset_links_target_uk UNIQUE (target_workspace, target_name, resource_type)
 );
@@ -506,117 +476,69 @@ CREATE INDEX idx_workspace_asset_links_source ON workspace_asset_links (source_w
 CREATE INDEX idx_workspace_asset_links_target ON workspace_asset_links (target_workspace, target_name);
 ```
 
-## `workspace_asset_operations`
+The unique target identity lets detach resolve the relationship from workspace, name, and the route's resource type. The association and lineage identifiers remain internal; they are not exposed in requests or resource responses.
 
-Durable audit log and idempotency table for all cross-workspace operations (SYNC, FORK, COPY, detach). For `COPY` mode operations, `relationship_type` is `"COPY"` and `association_id` is NULL.
+## Read and mutation behavior
 
-```sql
-CREATE TABLE workspace_asset_operations (
-    operation_id VARCHAR(32) NOT NULL,
-    idempotency_key VARCHAR(256),
-    created_by VARCHAR(256) NOT NULL DEFAULT '',
-    resource_type VARCHAR(64) NOT NULL,
-    source_workspace VARCHAR(63) NOT NULL,
-    source_name VARCHAR(256) NOT NULL,
-    target_workspace VARCHAR(63) NOT NULL,
-    target_name VARCHAR(256) NOT NULL,
-    status VARCHAR(32) NOT NULL,
-    version_mappings TEXT NOT NULL,
-    source_version VARCHAR(256),
-    creation_time BIGINT NOT NULL,
-    request_fingerprint VARCHAR(64),
-    copy_mode VARCHAR(64),
-    error_code VARCHAR(64),
-    error_message TEXT,
-    last_updated_time BIGINT,
-    relationship_type VARCHAR(16), -- "SYNC", "FORK", or "COPY"
-    association_id VARCHAR(32),   -- NULL for COPY mode operations
-    lineage_id VARCHAR(32),
-    source_snapshot_fingerprint VARCHAR(64),
-    CONSTRAINT workspace_asset_operations_pk PRIMARY KEY (operation_id),
-    CONSTRAINT workspace_asset_operations_idempotency_uk UNIQUE (target_workspace, resource_type, created_by, idempotency_key)
-);
+Synced assets are reachable through standard reads using their destination identity. After syncing `shared/support-assistant` to `team-search/support-assistant-reference`, getting the latter returns current source metadata with `workspace="team-search"` and `name="support-assistant-reference"`. Callers do not need to resolve a relationship themselves.
 
-CREATE INDEX idx_workspace_asset_operations_source ON workspace_asset_operations (source_workspace, source_name);
-CREATE INDEX idx_workspace_asset_operations_target ON workspace_asset_operations (target_workspace, target_name);
-```
+The following SDK methods and their REST counterparts include synced entities:
 
-## `workspace_asset_version_mappings`
+| Read surface | Prompts | Registered models | MCP servers |
+| :--- | :--- | :--- | :--- |
+| Parent get | `get_prompt` | `get_registered_model` | `get_mcp_server` |
+| Version get | `get_prompt_version` | `get_model_version` | `get_mcp_server_version` |
+| Alias resolution | `get_prompt_version_by_alias`; alias passed to `get_prompt_version` | `get_model_version_by_alias` | `get_mcp_server_version_by_alias` |
+| Version search/list | `search_prompt_versions` | `search_model_versions`, `get_latest_versions` | `search_mcp_server_versions`, `get_latest_mcp_server_version` |
+| Parent search/list | `search_prompts` | `search_registered_models` | `search_mcp_servers` |
 
-Stores source-to-target version mappings for materialized copies (`FORK`, `COPY`, `DETACH`).
+Version reads return source version content under the destination parent identity. Aliases and latest-version lookups follow current source assignments, including changes after the sync was created. UI lists use these same read surfaces.
 
-```sql
-CREATE TABLE workspace_asset_version_mappings (
-    operation_id VARCHAR(32) NOT NULL,
-    source_workspace VARCHAR(63) NOT NULL,
-    source_name VARCHAR(256) NOT NULL,
-    source_version VARCHAR(256) NOT NULL,
-    target_workspace VARCHAR(63) NOT NULL,
-    target_name VARCHAR(256) NOT NULL,
-    target_version VARCHAR(256) NOT NULL,
-    created_by VARCHAR(256),
-    creation_time BIGINT NOT NULL,
-    CONSTRAINT workspace_asset_version_mappings_pk PRIMARY KEY (operation_id, source_workspace, source_name, source_version),
-    CONSTRAINT workspace_asset_version_mappings_uk UNIQUE (operation_id, target_workspace, target_name, target_version)
-);
+Search filters on workspace and name apply to the destination identity, while content filters use the visible source metadata. Native and synced results participate in the same filtering, ordering, and pagination contract. Pagination must include eligible synced assets without duplicates or omissions in an unchanged result set. The implementation does not require callers to merge separate result streams.
 
-CREATE INDEX idx_workspace_asset_version_mappings_target ON workspace_asset_version_mappings (target_workspace, target_name, target_version);
-```
+Content mutations of synced destinations, such as creating versions, changing tags, or deleting the asset, return `INVALID_PARAMETER_VALUE` because synced assets are read-only. Detach enables independent editing. Forks and independent copies use ordinary destination reads and writes; only forks include source relationship metadata.
 
-# Read and mutation behavior
+## Rename and delete lifecycle
 
-- **Read Path for `SYNC`**: When a workspace lists or fetches assets, MLflow performs query-time SQL joins against `workspace_asset_links` where `relationship_type = "SYNC"`. The returned asset representations combine the target identity in the requested workspace with live source metadata.
-- **Mutation Path for `SYNC`**: Any write or update API called on a synced asset in the target workspace (such as `update_registered_model`, `create_model_version`, `set_registered_model_tag`, `delete_registered_model`) checks `workspace_asset_links`. If a `SYNC` association exists for that target, the operation is rejected immediately with an `INVALID_PARAMETER_VALUE` error stating that synced assets are read-only.
-- **Read/Mutation Path for `FORK` and `COPY`**: Forked and copied assets exist as standard rows in target database tables. They are fully editable independently of the source.
+Renaming an asset via `rename_registered_model` cascades atomically to `workspace_asset_links` within the exact same database transaction. If a source asset is renamed, active `SYNC` links update `source_name` to follow the renamed asset, preventing broken links or 404 errors. If a target asset is renamed in its destination workspace, `target_name` is updated.
 
-### Query-time SQL pagination: Polymorphic UNION ALL Virtual Subqueries
+Deleting a source asset with `SYNC` or `FORK` relationships returns `409 Conflict` by default. With `detach_dependents=true`, source deletion preserves dependent content and removes the relationships:
 
-For search and list operations (such as `search_registered_models` and `search_model_versions`), MLflow avoids application-layer memory stitching ($O(N)$ heap loading, sorting, and slicing). Instead, MLflow pushes filtering, sorting, and pagination down directly to the database engine using an ANSI SQL `UNION ALL` subquery structure:
+1. Snapshot the current content of each synced dependent into its destination.
+2. Remove the relationships to both synced dependents and forks. Existing fork content is unchanged; the dependents no longer reference the deleted source.
+3. Delete the source asset.
 
-- **Component 1 (Native rows)**: Selects native asset rows in the queried workspace (`workspace = :target_workspace`).
-- **Component 2 (Synced virtual rows)**: Joins `workspace_asset_links` (where `relationship_type = 'SYNC'`) with source asset tables, projecting and aliasing `target_workspace AS workspace` and `target_name AS name` while selecting the underlying source asset metadata.
-- **Component 3 (Push-down of Filtering, Ordering, and Pagination)**: The outer query wraps the combined `UNION ALL` subquery, applying client filter clauses (`WHERE`), composite sorting (`ORDER BY`), and cursor pagination (`LIMIT :max_results + 1 OFFSET :offset`) directly at the database engine level.
+These changes are committed together so that source deletion does not leave dangling links. Detaching a single synced asset for editing still retains a `FORK` relationship to its existing source.
 
-This design guarantees:
-- **100% ANSI SQL standard compliance** across all four supported relational backends (PostgreSQL, MySQL, SQLite, MSSQL).
-- **$O(\text{limit})$ memory efficiency**, avoiding full-table scans or memory spikes on workspaces with many synced assets.
-- **Deterministic cursor pagination** across page iterations.
-
-# Rename and delete lifecycle
-
-- **Rename Source or Target**: Renaming an asset via `rename_registered_model` cascades atomically to `workspace_asset_links` within the exact same database transaction. If a source asset is renamed, active `SYNC` links update `source_name` to follow the renamed asset, preventing broken links or 404 errors. If a target asset is renamed in its destination workspace, `target_name` is updated.
-- **Delete Source**: Deleting a source asset renders active `SYNC` links pointing to it in an orphaned state (source unavailable), with unlinking or detach options available to callers. Forked and copied assets remain completely unaffected since their target rows and URI pointers are materialized locally.
-- **Delete Fork or Copy Target**: Deleting a target asset removes the target rows and cleans up any associated link.
+Deleting a fork or copy target removes its local rows and incoming relationship, if present. If that target also serves as a source, the same source-deletion guard applies.
 
 # Acceptance criteria
 
-1. **Typed `copy` and `detach` Endpoints**: RPC endpoints and Python SDK support `copy` (with `SYNC`, `FORK`, and `COPY` modes) and `detach` routes for prompts, registered models, and MCP servers.
-2. **Decoupled `COPY` Mode**: `COPY` mode replaces target metadata and versions atomically if target exists (or creates it if absent) and creates **NO entry in `workspace_asset_links`**, leaving assets completely decoupled.
-3. **Target Conflict Error on `FORK`**: `FORK` mode checks target asset existence and raises `RESOURCE_ALREADY_EXISTS` (`409 Conflict`) if the target asset already exists in the target workspace.
-4. **Query-time `SYNC` Resolution**: `SYNC` links resolve live source metadata via SQL joins at query time without creating target asset rows or version mappings.
-5. **Read-Only `SYNC` Enforcement**: Any attempt to mutate a synced target asset returns an `INVALID_PARAMETER_VALUE` error.
-6. **Dedicated `DETACH` Endpoint**: Converts active `SYNC` link to `FORK`, snapshotting current state into target database rows and updating `workspace_asset_links.relationship_type = "FORK"`.
-7. **Client Overwrite Guardrail Guidance**: Client applications invoking `COPY` mode against an existing target asset are provided with clear documentation recommending a client-side confirmation step before executing destination overwrites.
-8. **Immutable Model Version Provenance Tags**: Copied model versions receive immutable `mlflow.copy.*` tags that cannot be modified or deleted via tag mutation endpoints.
-9. **Permissions & Idempotency**: Source `can_read` and target `can_update` permissions evaluated using native MLflow authorization primitives; safe retries guaranteed via `idempotency_key`.
+1. The MLflow UI, typed REST endpoints, and Python SDK support sync, fork, copy, and detach for all three asset types.
+2. Synced assets appear under their destination identity in every read surface listed above, including versions and aliases. Source changes are reflected in subsequent server reads; normal filtering, ordering, pagination, and visibility rules apply.
+3. Updating content, setting tags, creating versions, or deleting synced assets fails with `INVALID_PARAMETER_VALUE`. Detach produces an editable snapshot with `FORK` relationship metadata.
+4. Fork rejects existing destination names. Copy also rejects them unless `overwrite=true`; conflicts leave the destination unchanged.
+5. Confirmed copy replaces destination metadata and versions atomically and leaves no incoming source relationship on the copied asset.
+6. Copy and detach responses match the corresponding destination `GET`. Parent get/search/list representations include source relationship metadata only for `SYNC` and `FORK`.
+7. The SDK exposes separate typed sync/fork/copy methods, accepts source entities with workspace identity, and returns destination entities. Detach accepts workspace and name.
+8. The model registry and tracking stores implement the proposed contracts and use one parent relationship table.
+9. The UI requires explicit overwrite confirmation and supports deletion with explicit dependent detachment. Server checks enforce the same rules for direct API clients.
+10. Source deletion is blocked by either relationship type by default. Confirmed deletion snapshots synced dependents, preserves existing forks, removes source relationships, and leaves no dangling links.
+11. Renames through the existing registered-model API update the corresponding relationship names.
+12. Copies preserve the asset-specific metadata described above without transferring artifact bytes or adding provenance tags.
 
 # Drawbacks
 
-- Query-time joins for `SYNC` assets are pushed down to SQL via `UNION ALL` subqueries; while application memory overhead is prevented, query planning complexity increases slightly on the database engine.
+- Resolving live `SYNC` references adds complexity to asset queries.
 - Promoting back replaces parent asset metadata and version history with the fork's content rather than merging version trees.
 
 # Alternatives
 
-- **Artifact byte copying**: Copying underlying model artifacts alongside metadata. Rejected because synchronously transferring multi-gigabyte or hundred-gigabyte model weights through the MLflow tracking server would saturate server CPU, heap memory, and network throughput, leading to HTTP connection timeouts and requiring complex asynchronous saga orchestration. Preserving URI pointers provides an instantaneous, zero-byte copy operation that leaves binary management to underlying storage layers.
-- **Separate per-asset table prefixes**: Using `prompt_links`, `model_links`, etc. Rejected in favor of the unified `workspace_asset_*` table schema.
+- **Copy artifact files as well as metadata** would make storage independently manageable, but requires a separate transfer and failure-handling design. This proposal preserves artifact references and leaves storage replication to existing tooling.
+- **Separate per-asset table prefixes**: Using `prompt_links`, `model_links`, etc. Rejected in favor of the unified `workspace_asset_links` table.
 
 # Adoption strategy
 
-1. Apply Alembic migrations to create `workspace_asset_links`, `workspace_asset_operations`, and `workspace_asset_version_mappings`.
-2. Expose typed REST handlers and `MlflowClient` SDK methods.
-3. Expose the operations through the Python `MlflowClient` SDK and REST APIs for adoption by external platforms and client applications.
-
-# Open questions
-
-- Retention policies for historical operation records in `workspace_asset_operations`.
-- Recovery and cleanup user experience for orphaned `SYNC` links when a source asset is deleted.
+1. Add the relationship table through the applicable SQL store migrations.
+2. Implement the store contracts, existing read and lifecycle integrations, typed REST endpoints, and SDK methods.
+3. Expose the workflows in the MLflow UI, including overwrite confirmation and source deletion with dependent detachment.
