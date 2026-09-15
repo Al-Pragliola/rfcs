@@ -6,7 +6,7 @@ rfc_pr: https://github.com/Al-Pragliola/rfcs/pull/1
 
 # RFC 0014: Cross-workspace MLflow asset sharing and copying
 
-| **Date Last Modified** | 2026-09-05 |
+| **Date Last Modified** | 2026-09-15 |
 | :--------------------- | :--------- |
 
 **Table of contents**
@@ -159,7 +159,9 @@ An asset is identified by its resource type, workspace, and name. Operations app
 | Copy | Editable snapshot | None |
 | Detach | Materializes the current synced content in place | Changes `SYNC` to `FORK` |
 
-`SYNC` stores a relationship without creating destination asset or version rows. `FORK` and `COPY` materialize destination metadata. A fork fails if the destination asset already exists. `COPY` replaces the destination's metadata and full version history only when `overwrite=true`; with the default `overwrite=false`, an existing destination causes a conflict.
+`SYNC` stores a relationship without creating destination asset or version rows. `FORK` and `COPY` materialize destination metadata. Sync and fork fail if the destination identity is already occupied by a native asset or another link, including a sync to the same source. Ordinary asset creation also rejects names occupied by links. These name checks and destination creation must be atomic so concurrent requests cannot create duplicate identities.
+
+`COPY` replaces the destination's metadata and full version history only when `overwrite=true`; with the default `overwrite=false`, an existing destination causes a conflict.
 
 A copied destination has no incoming source relationship, including when it replaces a fork. Detach takes a snapshot of an active `SYNC` relationship and changes it to `FORK`, allowing the destination content to be edited independently.
 
@@ -171,7 +173,9 @@ Source deletion preserves dependent content and removes the relationships to the
 | :--- | :--- | :--- |
 | **Prompt** | Prompt template text, descriptions, version history, asset/version tags, and aliases. (Prompts map physically to registered_model schema). | Workspace ownership, internal database primary keys, permissions. |
 | **Registered Model** | Model description, asset tags, version history, version tags, aliases, and exact `source`/`storage_location` URI strings. | Workspace ownership, internal primary keys, permissions. Artifact bytes are never copied. |
-| **MCP Server** | Server configuration, description, version history, tags, and endpoints. | Secret values and runtime container deployment state. |
+| **MCP Server** | Parent `display_name`, `description`, `icons`, and tags; complete version history including `version`, `server_json`, version `display_name`, `status`, `tools`, `source`, and tags; aliases and their version targets. | Workspace ownership, internal primary keys, permissions, system-managed audit fields, secret values, and runtime container deployment state. Parent `status` and `latest_version` remain derived fields. |
+
+The MCP fields above correspond to the server, version, tag, and alias entities in [RFC 0004](../0004-mcp-registry/0004-mcp-registry.md#entities-and-data-model). Endpoint declarations inside `server_json`, including `remotes[]`, are part of the copied definition metadata. Whether the separate approved connection records, `MCPAccessBinding`, should also be included remains an open review question.
 
 ### Storage URI pointer semantics and runtime access prerequisites
 
@@ -183,12 +187,15 @@ Fork lineage is recorded by the parent relationship in `workspace_asset_links`. 
 
 ## Authorization and visibility
 
-Authorization for copy and detach uses native MLflow permissions primitives:
+Authorization for copy and detach uses native MLflow permission primitives, distinguishing workspace access and resource creation from permissions on an existing asset:
 
-- **Source Read Permission**: The requesting user must have `can_read` (or workspace read capability) on the source workspace and asset.
-- **Target Write Permission**: The requesting user must have `can_update` or `can_use` (or workspace write capability) on the target workspace.
+- **Source Read Permission**: The requesting user must have access to the source workspace and `can_read` on the source asset.
+- **Target Creation Permission**: Creating a destination requires access to the target workspace and its existing resource-creation permission.
+- **Target Update Permission**: Updating an existing destination requires access to its workspace and `can_update` on that asset. Asset-level `can_use` alone does not authorize updates.
 
-For overwrite `copy` (including promote-back), the user must have read access on the source asset and `can_update` / write permission on the target destination workspace asset.
+Under the current [permission definitions](https://github.com/mlflow/mlflow/blob/master/mlflow/server/auth/permissions.py), workspace-level `USE` includes resource creation. At asset scope, `READ` provides `can_read`, `USE` does not provide `can_update`, `EDIT` provides `can_update`, and `MANAGE` also provides `can_delete` and `can_manage`.
+
+For overwrite `copy` (including promote-back), source read and destination update permissions are required. Whether full-history replacement should additionally require destination `can_delete` (`MANAGE` under current levels) remains an open review question.
 
 Permissions checks are evaluated before any database mutations are performed.
 
@@ -212,13 +219,13 @@ Copy and detach retain the single SQL transaction design:
 
 1. Validate input parameters and permissions.
 2. Read the source snapshot or validate the relationship state.
-3. Check destination conflicts. A fork fails if the target exists. A copy can replace an existing target only with `overwrite=true`.
+3. Check destination conflicts across native assets and links. Sync and fork fail if the target exists. A copy can replace an existing target only with `overwrite=true`.
 4. Materialize destination metadata where required and insert, update, or remove the parent relationship.
 5. Commit the transaction and return the destination resource.
 
 The server enforces the overwrite parameter; UI confirmation is the user-facing step that supplies it.
 
-A repeated fork or copy with `overwrite=false` can report that the target already exists. A request with `overwrite=true` remains an explicit replacement.
+A repeated sync, fork, or copy with `overwrite=false` can report that the target already exists. A request with `overwrite=true` remains an explicit replacement.
 
 ## API
 
@@ -245,7 +252,7 @@ The route selects the asset type; the request cannot substitute another resource
 | `relationship_type` | Defaults to `"FORK"` | `"SYNC"`, `"FORK"`, or `"COPY"` |
 | `overwrite` | Boolean, defaults to `false` | Allows `COPY` to replace an existing destination |
 
-A `COPY` request against an existing destination without `overwrite=true` returns `409 Conflict` and leaves it unchanged. The overwrite parameter applies to `COPY`; `FORK` retains its existing destination-conflict behavior.
+A `SYNC` or `FORK` request returns `409 Conflict` if the destination is occupied by a native asset or another link. A `COPY` request against an existing destination without `overwrite=true` also returns `409 Conflict`. These conflicts leave the destination unchanged. The overwrite parameter applies only to `COPY` and cannot permit sync or fork to replace an existing destination.
 
 ### Detach requests
 
@@ -449,7 +456,7 @@ SQL store implementations perform the copy and detach transactions. REST store i
 | `400 Bad Request` | Missing required fields, invalid parameters, or content mutation/deletion of a read-only synced asset; `INVALID_PARAMETER_VALUE` |
 | `403 Forbidden` | Insufficient source or destination permissions |
 | `404 Not Found` | Required source or target asset does not exist; `RESOURCE_DOES_NOT_EXIST` |
-| `409 Conflict` | Existing destination for fork or copy without overwrite; `RESOURCE_ALREADY_EXISTS` |
+| `409 Conflict` | Destination occupied by a native asset or link for sync, fork, or copy without overwrite; `RESOURCE_ALREADY_EXISTS` |
 | `409 Conflict` | Source deletion has dependents without explicit consent; `RESOURCE_CONFLICT` |
 
 ## Database schema
@@ -517,7 +524,7 @@ Deleting a fork or copy target removes its local rows and incoming relationship,
 1. The MLflow UI, typed REST endpoints, and Python SDK support sync, fork, copy, and detach for all three asset types.
 2. Synced assets appear under their destination identity in every read surface listed above, including versions and aliases. Source changes are reflected in subsequent server reads; normal filtering, ordering, pagination, and visibility rules apply.
 3. Updating content, setting tags, creating versions, or deleting synced assets fails with `INVALID_PARAMETER_VALUE`. Detach produces an editable snapshot with `FORK` relationship metadata.
-4. Fork rejects existing destination names. Copy also rejects them unless `overwrite=true`; conflicts leave the destination unchanged.
+4. Sync and fork reject destination names occupied by native assets or links. Ordinary asset creation also rejects names occupied by links. Copy rejects occupied names unless `overwrite=true`; conflicts leave the destination unchanged.
 5. Confirmed copy replaces destination metadata and versions atomically and leaves no incoming source relationship on the copied asset.
 6. Copy and detach responses match the corresponding destination `GET`. Parent get/search/list representations include source relationship metadata only for `SYNC` and `FORK`.
 7. The SDK exposes separate typed sync/fork/copy methods, accepts source entities with workspace identity, and returns destination entities. Detach accepts workspace and name.
