@@ -1,7 +1,7 @@
 ---
 start_date: 2026-09-02
 mlflow_issue: TBD
-rfc_pr: https://github.com/Al-Pragliola/rfcs/pull/1
+rfc_pr: https://github.com/mlflow/rfcs/pull/51
 ---
 
 # RFC 0014: Cross-workspace MLflow asset sharing and copying
